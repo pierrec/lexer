@@ -43,6 +43,16 @@ fn Value! Trie.get(&self, char[] key)
 /**
  * @require self.nodes.len() > 0
  **/
+fn Value! Trie.get_best(&self, char[] key)
+{
+    TrieNode* root = &self.nodes[0];
+    if (key.len == 0) return root.valid ? root.value : SearchResult.MISSING?;
+    return root.get_best(self, key, 0);
+}
+
+/**
+ * @require self.nodes.len() > 0
+ **/
 fn void! Trie.set(&self, char[] key, Value value)
 {
     self.nodes[0].set(self, key, value)!!;
@@ -73,6 +83,25 @@ fn Value! TrieNode.get(&self, Trie *t, char[] key) @private
     Index idx = self.children[c];
     if (idx == 0) return SearchResult.MISSING?;
     return t.nodes[idx].get(t, key[1..]);
+}
+
+fn Value! TrieNode.get_best(&self, Trie *t, char[] key, Index result) @private
+{
+    if (key.len == 0)
+    {
+        if (result == 0) return SearchResult.MISSING?;
+        return t.nodes[result].value;
+    }
+    char c = key[0];
+    Index idx = self.children[c];
+    if (idx == 0)
+    {
+        if (result == 0) return SearchResult.MISSING?;
+        return t.nodes[result].value;
+    }
+    TrieNode* next = &t.nodes[idx];
+    if (next.valid) result = idx;
+    return next.get_best(t, key[1..], result);
 }
 
 fn void! TrieNode.set(&self, Trie *t, char[] key, Value value) @private
@@ -115,14 +144,15 @@ fn void! TrieNode.del(&self, Trie* t, char[] key, TriePath path) @private
     {
         Index parent = path[i];
         bool is_empty = true;
-        foreach (j, p : t.nodes[parent].children)
+        TrieNode* node = &t.nodes[parent];
+        foreach (j, p : node.children)
         {
             if (p == current)
             {
-                t.nodes[parent].children[j] = 0;
+                node.children[j] = 0;
                 (&t.nodes[p]).valid = false;
             }
-            is_empty = is_empty && t.nodes[parent].children[j] == 0;
+            is_empty = is_empty && node.children[j] == 0;
         }
         if (!is_empty) break;
     }

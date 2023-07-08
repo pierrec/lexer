@@ -18,6 +18,12 @@ fn void test()
     assert(w == "hi");
     if (try invalid = t.get("hello")) assert(false, "key 'hello' should not exist");
 
+    if (catch t.set("hello", "hoi")) assert(false, "key not added");
+    String ww = t.get("hello")!!;
+    assert(ww == "hoi");
+    ww = t.get_best("hello world")!!;
+    assert(ww == "hi");
+
     t.del("a")!!;
     String! x = t.get("a");
     if (try x) assert(false, "key 'a' should not exist");
