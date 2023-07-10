@@ -8,7 +8,7 @@ enum Kind
     UINT,
     STRING,
     RUNE,
-    COMMENT,
+    TOKEN,
     IDENTIFIER,
 }
 
@@ -18,14 +18,17 @@ fault LexerError
     UNTERMINATED_RUNE,
 }
 
-def Trie = trie::Trie(<usz, ushort>);
+def Trie = trie::Trie(<String, ushort>);
+
+def Ident = fn bool (char);
 
 struct Lexer
 {
     Allocator* allocator;
     ByteReader* buf;
     Trie tokens;
-    String path;
+    Ident ident;
+    ushort max_token;
     bool peeked;
     uint line;
     uint column;
@@ -37,14 +40,17 @@ struct Lexer
     }
 }
 
-fn void! Lexer.init(&self, ByteReader *buf, String[] tokens, String path = "", Allocator* using = mem::heap())
+fn void! Lexer.init(&self, ByteReader *buf, String[] tokens, Ident ident, Allocator* using = mem::heap())
 {
     Trie trie;
-    foreach (i, tok : tokens)
+    ushort max_token;
+    foreach (tok : tokens)
     {
-        trie.set(tok, i)!;
+        trie.set(tok, tok)!;
+        max_token = max(max_token, (ushort)tok.len);
     }
-    *self = { .allocator = using, .buf = buf, .tokens = trie, .path = path };
+    assert(max_token <= buf.bytes.len);
+    *self = { .allocator = using, .buf = buf, .tokens = trie, .max_token = max_token };
 }
 
 fn Kind! Lexer.next(&self)
@@ -63,7 +69,16 @@ fn Kind! Lexer.next(&self)
             self.rune = self.parse_rune()!;
             return RUNE;
     }
-
+    if (try tok = self.parse_token())
+    {
+        self.string = tok;
+        return TOKEN;
+    }
+    if (try tok = self.parse_ident())
+    {
+        self.string = tok;
+        return IDENTIFIER;
+    }
 
     return UNKNOWN;
 }
@@ -262,4 +277,29 @@ macro char! Lexer.read_char_for_string(&self)
             return err?;
     }
     return c;
+}
+
+fn String! Lexer.parse_token(&self)
+{
+    char[] key = self.buf.bytes[:self.max_token];
+    return self.tokens.get_best(key);
+}
+
+fn String! Lexer.parse_ident(&self)
+{
+    DString str;
+    str.init(8, self.allocator);
+    while (true)
+    {
+        char! c = self.buf.read_byte();
+        if (catch err = c)
+        {
+            case IoError.EOF:
+                return str.as_str();
+            default:
+                return err?;
+        }
+        if (!self.ident(c)) return str.as_str();
+        str.append_char(c);
+    }
 }
