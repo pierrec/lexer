@@ -1,8 +1,9 @@
 /**
  * @require Token.kindof == ENUM && $typefrom(Token.inner).kindof == UNSIGNED_INT
  * @require $checks(((Token)0).token)
+ * @require $checks(((Comment)0).start) && $checks(((Comment)0).end)
  **/
-module lexer(<Token>);
+module lexer(<Token, Comment>);
 import std::io;
 import trie;
 
@@ -18,9 +19,9 @@ enum Kind
 
 fault LexerError
 {
-    TOKEN_TOO_LONG,
     UNTERMINATED_STRING,
     UNTERMINATED_RUNE,
+    UNTERMINATED_COMMENT,
 }
 
 def TokenTrie = trie::Trie(<Token, ushort>);
@@ -54,9 +55,15 @@ fn void! Lexer.init(&self, Stream reader, Ident ident, Allocator* using = mem::h
     foreach (i, tok : Token.values)
     {
         String name = tok.token;
+        assert(name.len > 0 && name.len <= ushort.max);
         trie.set(name, (Token)i)!;
-        if (name.len > ushort.max) return LexerError.TOKEN_TOO_LONG?;
         max_token = max(max_token, (ushort)name.len);
+    }
+    foreach (tok : Comment.values)
+    {
+        String end = tok.end;
+        assert(end.len > 0 && end.len <= ushort.max);
+        max_token = max(max_token, (ushort)end.len);
     }
     char* buf = using.alloc(max_token)!;
     *self = { .allocator = using, .reader = reader, .buf = buf[:max_token], .tokens = trie };
@@ -91,6 +98,14 @@ fn Kind! Lexer.next(&self)
     }
     if (try tok = self.parse_token())
     {
+        foreach (comment : Comment.values)
+        {
+            if (comment.start == tok)
+            {
+                self.parse_comment(comment.end)!;
+                break;
+            }
+        }
         self.token = tok;
         return TOKEN;
     }
@@ -325,12 +340,52 @@ macro char! Lexer.read_char_for_string(&self) @private
 fn Token! Lexer.parse_token(&self) @private
 {
     usz n = self.reader.read(self.buf)!;
+    defer self.unread(n);
     Token tok = self.tokens.get_best(self.buf[:n])!;
-    for (n -= tok.token.len; n; n--)
-    {
-        self.reader.pushback_byte()!!;
-    }
+    n = self.buf.len - tok.token.len;
     return tok;
+}
+
+fn void! Lexer.parse_comment(&self, String end) @private
+{
+    // Find the end token and accumulate the data in between.
+    DString acc;
+    acc.init(8, self.allocator);
+    char[] buf = self.buf[:end.len];
+    while (true)
+    {
+        if (catch err = self.reader.read_all(buf))
+        {
+            case IoError.UNEXPECTED_EOF:
+            case IoError.EOF:
+                return LexerError.UNTERMINATED_COMMENT?;
+            default:
+                return err?;
+        }
+        if (end == (String)buf)
+        {
+            self.string = acc.as_str();
+            return;
+        }
+        acc.append_char(buf[0]);
+        self.unread(buf.len - 1);
+    }
+}
+
+macro Lexer.unread(self, n) @private
+{
+    switch
+    {
+        case n == 1:
+            self.reader.pushback_byte()!!;
+        case n > 1:
+            if (SeekStreamFn func = self.reader.fns.seek_fn)
+            {
+		        func(self.reader, -n, CURSOR)!!;
+		        break;
+            }
+            for (; n > 0; n--) self.reader.pushback_byte()!!;
+    }
 }
 
 fn String! Lexer.parse_ident(&self) @private
