@@ -1,4 +1,8 @@
-module lexer;
+/**
+ * @require Token.kindof == ENUM && $typefrom(Token.inner).kindof == UNSIGNED_INT
+ * @require $checks(((Token)0).token)
+ **/
+module lexer(<Token>);
 import std::io;
 import trie;
 
@@ -14,52 +18,68 @@ enum Kind
 
 fault LexerError
 {
+    TOKEN_TOO_LONG,
     UNTERMINATED_STRING,
     UNTERMINATED_RUNE,
 }
 
-def Trie = trie::Trie(<String, ushort>);
+def TokenTrie = trie::Trie(<Token, ushort>);
 
-def Ident = fn bool (char);
+def Ident = fn bool (usz index, char c);
 
 struct Lexer
 {
     Allocator* allocator;
-    ByteReader* buf;
-    Trie tokens;
+    Stream reader;
+    char[] buf;
+    TokenTrie tokens;
     Ident ident;
-    ushort max_token;
     bool peeked;
+    Kind kind;
     uint line;
     uint column;
     uint span;
     union {
-        ulong x;
-        String string;
-        char rune;
+        ulong x;       // UINT
+        String string; // STRING, IDENTIFIER
+        char rune;     // RUNE
+        Token token;   // TOKEN
     }
 }
 
-fn void! Lexer.init(&self, ByteReader *buf, String[] tokens, Ident ident, Allocator* using = mem::heap())
+fn void! Lexer.init(&self, Stream reader, Ident ident, Allocator* using = mem::heap())
 {
-    Trie trie;
+    TokenTrie trie;
     ushort max_token;
-    foreach (tok : tokens)
+    foreach (i, tok : Token.values)
     {
-        trie.set(tok, tok)!;
-        max_token = max(max_token, (ushort)tok.len);
+        String name = tok.token;
+        trie.set(name, (Token)i)!;
+        if (name.len > ushort.max) return LexerError.TOKEN_TOO_LONG?;
+        max_token = max(max_token, (ushort)name.len);
     }
-    assert(max_token <= buf.bytes.len);
-    *self = { .allocator = using, .buf = buf, .tokens = trie, .max_token = max_token };
+    char* buf = using.alloc(max_token)!;
+    *self = { .allocator = using, .reader = reader, .buf = buf[:max_token], .tokens = trie };
+}
+
+fn void! Lexer.free(&self)
+{
+    self.allocator.free(self.buf)!;
+    *self = {};
 }
 
 fn Kind! Lexer.next(&self)
 {
-    char c = self.buf.read_byte()!;
+    if (self.peeked)
+    {
+        self.peeked = false;
+        return self.kind;
+    }
+    char c = self.reader.read_byte()!;
     switch
     {
         case c.is_digit():
-            self.buf.pushback_byte()!!;
+            self.reader.pushback_byte()!!;
             self.x = self.parse_uint()!;
             return UINT;
         case c == '"':
@@ -71,7 +91,7 @@ fn Kind! Lexer.next(&self)
     }
     if (try tok = self.parse_token())
     {
-        self.string = tok;
+        self.token = tok;
         return TOKEN;
     }
     if (try tok = self.parse_ident())
@@ -83,15 +103,38 @@ fn Kind! Lexer.next(&self)
     return UNKNOWN;
 }
 
-fn void! Lexer.skip_whitespace(&self)
+fn Kind! Lexer.peek(&self)
+{
+    if (!self.peeked)
+    {
+        self.kind = self.next()!;
+        self.peeked = true;
+    }
+    return self.kind;
+}
+
+fn Token! Lexer.expect(&self, anyfault err, Token... tokens)
+{
+    Kind kind = self.next()!;
+    if (kind == TOKEN)
+    {
+        foreach (tok : tokens)
+        {
+            if (tok == self.token) return tok;
+        }
+    }
+    return err?;
+}
+
+fn void! Lexer.skip_whitespace(&self) @private
 {
     self.span = 0;
     while (true)
     {
-        char c = self.buf.read_byte()!;
+        char c = self.reader.read_byte()!;
         if (!c.is_space())
         {
-            self.buf.pushback_byte()!!;
+            self.reader.pushback_byte()!!;
             return;
         }
         if (c == '\n')
@@ -106,13 +149,13 @@ fn void! Lexer.skip_whitespace(&self)
     }
 }
 
-fn ulong! Lexer.parse_uint(&self)
+fn ulong! Lexer.parse_uint(&self) @private
 {
     ulong x;
-    char c = self.buf.read_byte()!;
+    char c = self.reader.read_byte()!;
     if (c == '0')
     {
-        c = self.buf.read_byte()!;
+        c = self.reader.read_byte()!;
         switch (c)
         {
             case 'x':
@@ -130,7 +173,7 @@ fn ulong! Lexer.parse_uint(&self)
     return self.parse_decimal()!;
 }
 
-fn ulong! Lexer.parse_decimal(&self)
+fn ulong! Lexer.parse_decimal(&self) @private
 {
     return @parse_uint(self, ulong; ulong x, char c, bool ok)
     {
@@ -142,7 +185,7 @@ fn ulong! Lexer.parse_decimal(&self)
     };
 }
 
-fn ulong! Lexer.parse_hexadecimal(&self)
+fn ulong! Lexer.parse_hexadecimal(&self) @private
 {
     return @parse_uint(self, ulong; ulong x, char c, bool ok)
     {
@@ -159,7 +202,7 @@ fn ulong! Lexer.parse_hexadecimal(&self)
     };
 }
 
-fn ulong! Lexer.parse_binary(&self)
+fn ulong! Lexer.parse_binary(&self) @private
 {
     return @parse_uint(self, ulong; ulong x, char c, bool ok)
     {
@@ -171,7 +214,7 @@ fn ulong! Lexer.parse_binary(&self)
     };
 }
 
-fn ulong! Lexer.parse_octal(&self)
+fn ulong! Lexer.parse_octal(&self) @private
 {
     return @parse_uint(self, ulong; ulong x, char c, bool ok)
     {
@@ -183,13 +226,13 @@ fn ulong! Lexer.parse_octal(&self)
     };
 }
 
-macro @parse_uint(self, $Type; @body(x, c, ok))
+macro @parse_uint(self, $Type; @body(x, c, ok)) @private
 {
     $Type x;
     uint column = self.column;
     while (true)
     {
-        char! c = self.buf.read_byte();
+        char! c = self.reader.read_byte();
         if (catch err = c)
         {
             case IoError.EOF:
@@ -208,7 +251,7 @@ macro @parse_uint(self, $Type; @body(x, c, ok))
             if (!ok)
             {
                 self.column--;
-                self.buf.pushback_byte()!!;
+                self.reader.pushback_byte()!!;
                 break;
             }
         }
@@ -217,12 +260,12 @@ macro @parse_uint(self, $Type; @body(x, c, ok))
     return x;
 }
 
-fn String! Lexer.parse_string(&self, char quote)
+fn String! Lexer.parse_string(&self, char quote) @private
 {
-    DString str;
-    str.init(8, self.allocator);
     char c = self.read_char_for_string()!;
     if (c == quote) return "";
+    DString str;
+    str.init(8, self.allocator);
     char prev;
     while (true)
     {
@@ -258,17 +301,17 @@ fn String! Lexer.parse_string(&self, char quote)
     }
 }
 
-fn char! Lexer.parse_rune(&self)
+fn char! Lexer.parse_rune(&self) @private
 {
-    char x = self.buf.read_byte()!;
-    char c = self.buf.read_byte()!;
+    char x = self.reader.read_byte()!;
+    char c = self.reader.read_byte()!;
     if (c != '\'') return LexerError.UNTERMINATED_RUNE?;
     return x;
 }
 
-macro char! Lexer.read_char_for_string(&self)
+macro char! Lexer.read_char_for_string(&self) @private
 {
-    char! c = self.buf.read_byte();
+    char! c = self.reader.read_byte();
     if (catch err = c)
     {
         case IoError.EOF:
@@ -279,19 +322,24 @@ macro char! Lexer.read_char_for_string(&self)
     return c;
 }
 
-fn String! Lexer.parse_token(&self)
+fn Token! Lexer.parse_token(&self) @private
 {
-    char[] key = self.buf.bytes[:self.max_token];
-    return self.tokens.get_best(key);
+    usz n = self.reader.read(self.buf)!;
+    Token tok = self.tokens.get_best(self.buf[:n])!;
+    for (n -= tok.token.len; n; n--)
+    {
+        self.reader.pushback_byte()!!;
+    }
+    return tok;
 }
 
-fn String! Lexer.parse_ident(&self)
+fn String! Lexer.parse_ident(&self) @private
 {
     DString str;
     str.init(8, self.allocator);
     while (true)
     {
-        char! c = self.buf.read_byte();
+        char! c = self.reader.read_byte();
         if (catch err = c)
         {
             case IoError.EOF:
@@ -299,7 +347,7 @@ fn String! Lexer.parse_ident(&self)
             default:
                 return err?;
         }
-        if (!self.ident(c)) return str.as_str();
+        if (!self.ident(str.len(), c)) return str.as_str();
         str.append_char(c);
     }
 }
