@@ -7,7 +7,7 @@ module lexer(<Token, Comment>);
 import std::io;
 import trie;
 
-enum Kind
+enum Kind : char
 {
     UNKNOWN,
     UINT,
@@ -24,7 +24,7 @@ fault LexerError
     UNTERMINATED_COMMENT,
 }
 
-def TokenTrie = trie::Trie(<Token, ushort>);
+def TokenTrie = Trie(<Token, ushort>);
 
 def Ident = fn bool (usz index, char c);
 
@@ -51,6 +51,7 @@ struct Lexer
 fn void! Lexer.init(&self, Stream reader, Ident ident, Allocator* using = mem::heap())
 {
     TokenTrie trie;
+    trie.init(.using = using);
     ushort max_token;
     foreach (i, tok : Token.values)
     {
@@ -66,7 +67,7 @@ fn void! Lexer.init(&self, Stream reader, Ident ident, Allocator* using = mem::h
         max_token = max(max_token, (ushort)end.len);
     }
     char* buf = using.alloc(max_token)!;
-    *self = { .allocator = using, .reader = reader, .buf = buf[:max_token], .tokens = trie };
+    *self = { .allocator = using, .reader = reader, .buf = buf[:max_token], .tokens = trie, .ident = ident };
 }
 
 fn void! Lexer.free(&self)
@@ -96,7 +97,7 @@ fn Kind! Lexer.next(&self)
             self.rune = self.parse_rune()!;
             return RUNE;
     }
-    if (try tok = self.parse_token())
+    if (try tok = self.parse_token(c))
     {
         foreach (comment : Comment.values)
         {
@@ -109,12 +110,11 @@ fn Kind! Lexer.next(&self)
         self.token = tok;
         return TOKEN;
     }
-    if (try tok = self.parse_ident())
+    if (try tok = self.parse_ident(c))
     {
         self.string = tok;
         return IDENTIFIER;
     }
-
     return UNKNOWN;
 }
 
@@ -166,12 +166,18 @@ fn void! Lexer.skip_whitespace(&self) @private
 
 fn ulong! Lexer.parse_uint(&self) @private
 {
-    ulong x;
     char c = self.reader.read_byte()!;
-    if (c == '0')
+    if ZERO: (c == '0')
     {
-        c = self.reader.read_byte()!;
-        switch (c)
+        char! cc = self.reader.read_byte();
+        if (catch err = cc)
+        {
+            case IoError.EOF:
+                break ZERO;
+            default:
+                return err?;
+        }
+        switch (cc)
         {
             case 'x':
                 self.span = 2;
@@ -183,96 +189,88 @@ fn ulong! Lexer.parse_uint(&self) @private
                 self.span = 2;
                 return self.parse_octal()!;
         }
+        // The next pushback restores this character, making
+        // the first 0 ignored.
     }
+    self.reader.pushback_byte()!!;
     self.span = 0;
     return self.parse_decimal()!;
 }
 
 fn ulong! Lexer.parse_decimal(&self) @private
 {
-    return @parse_uint(self, ulong; ulong x, char c, bool ok)
+    return @parse_uint(self; char c)
     {
         if (c.is_digit())
         {
-            x = x * 10 + (ulong)(c - '0');
-            ok = true;
+            self.x = self.x * 10 + (ulong)(c - '0');
         }
     };
 }
 
 fn ulong! Lexer.parse_hexadecimal(&self) @private
 {
-    return @parse_uint(self, ulong; ulong x, char c, bool ok)
+    return @parse_uint(self; char c)
     {
         switch
         {
             case c.is_digit():
-                x = x * 10 + (ulong)(c - '0');
-                ok = true;
+                self.x = self.x * 10 + (ulong)(c - '0');
             case c.is_xdigit():
                 c -= c < 'A' ? 'a' : 'A';
-                x = x * 16 + (ulong)c;
-                ok = true;
+                self.x = self.x * 16 + (ulong)c;
         }
     };
 }
 
 fn ulong! Lexer.parse_binary(&self) @private
 {
-    return @parse_uint(self, ulong; ulong x, char c, bool ok)
+    return @parse_uint(self; char c)
     {
         if (c.is_digit())
         {
-            x = x * 2 + (ulong)(c - '0');
-            ok = true;
+            self.x = self.x * 2 + (ulong)(c - '0');
         }
     };
 }
 
 fn ulong! Lexer.parse_octal(&self) @private
 {
-    return @parse_uint(self, ulong; ulong x, char c, bool ok)
+    return @parse_uint(self; char c)
     {
         if (c.is_odigit())
         {
-            x = x * 8 + (ulong)(c - '0');
-            ok = true;
+            self.x = self.x * 8 + (ulong)(c - '0');
         }
     };
 }
 
-macro @parse_uint(self, $Type; @body(x, c, ok)) @private
+macro @parse_uint(self; @body(c)) @private
 {
-    $Type x;
     uint column = self.column;
-    while (true)
+    while LOOP: (true)
     {
         char! c = self.reader.read_byte();
         if (catch err = c)
         {
             case IoError.EOF:
-                break;
+                break LOOP;
             default:
                 return err?;
         }
-        else
+        self.column++;
+        if (c == '_') continue;
+        ulong xx = self.x;
+        @body(c);
+        if (xx > self.x) return NumberConversion.INTEGER_OVERFLOW?;
+        if (xx == self.x)
         {
-            self.column++;
-            if (c == '_') continue;
-            $Type xx = x;
-            bool ok;
-            @body(x, c, ok);
-            if (xx > x) return NumberConversion.INTEGER_OVERFLOW?;
-            if (!ok)
-            {
-                self.column--;
-                self.reader.pushback_byte()!!;
-                break;
-            }
+            self.column--;
+            self.reader.pushback_byte()!!;
+            break;
         }
     }
     self.span = self.column - column;
-    return x;
 }
 
 fn String! Lexer.parse_string(&self, char quote) @private
@@ -281,38 +279,34 @@ fn String! Lexer.parse_string(&self, char quote) @private
     if (c == quote) return "";
     DString str;
     str.init(8, self.allocator);
-    char prev;
     while (true)
     {
-        c = self.read_char_for_string()!;
-        if (prev != '\\')
+        if (c == '\\')
         {
-            str.append_char(prev);
-            if (c == quote)
+            c = self.read_char_for_string()!;
+            switch (c)
             {
-                self.span = (uint)str.len();
-                self.column += self.span + 2;
-                return str.as_str();
+                case 'a':
+                case 'b':
+                case '\\':
+                case '\n':
+                case '\f':
+                case '\r':
+                case '\v':
+                case '"':
+                case '\'':
+                    break;
+                default: c = '\\';
             }
-            prev = c;
-            continue;
-        }
-        prev = c;
-        switch (c)
-        {
-            case 'a':
-            case 'b':
-            case '\\':
-            case '\n':
-            case '\f':
-            case '\r':
-            case '\v':
-            case '"':
-            case '\'':
-                break;
-            default: c = '\\';
         }
         str.append_char(c);
+        c = self.read_char_for_string()!;
+        if (c == quote)
+        {
+            self.span = (uint)str.len();
+            self.column += self.span + 2;
+            return str.as_str();
+        }
     }
 }
 
@@ -337,11 +331,12 @@ macro char! Lexer.read_char_for_string(&self) @private
     return c;
 }
 
-fn Token! Lexer.parse_token(&self) @private
+fn Token! Lexer.parse_token(&self, char cc) @private
 {
-    usz n = self.reader.read(self.buf)!;
+    self.buf[0] = cc;
+    usz n = self.reader.read(self.buf[1..])!;
     defer self.unread(n);
-    Token tok = self.tokens.get_best(self.buf[:n])!;
+    Token tok = self.tokens.get_best(self.buf[:n + 1])!;
     n = self.buf.len - tok.token.len;
     return tok;
 }
@@ -372,7 +367,7 @@ fn void! Lexer.parse_comment(&self, String end) @private
     }
 }
 
-macro Lexer.unread(self, n) @private
+macro Lexer.unread(&self, n) @private
 {
     switch
     {
@@ -388,10 +383,11 @@ macro Lexer.unread(self, n) @private
     }
 }
 
-fn String! Lexer.parse_ident(&self) @private
+fn String! Lexer.parse_ident(&self, char cc) @private
 {
     DString str;
     str.init(8, self.allocator);
+    str.append_char(cc);
     while (true)
     {
         char! c = self.reader.read_byte();
